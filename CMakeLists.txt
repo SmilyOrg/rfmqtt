@@ -3,20 +3,20 @@ include(ExternalProject)
 
 project(rfmqtt CXX)
 
-add_definitions(
+set(includes
+	src/vendor/
+	src/vendor/yaml-cpp/include/
+	src/vendor/paho.mqtt.c/src/
 )
-
-# set(includes
-	# src/vendor/paho.mqtt.c/src/
-	# src/vendor/yaml-cpp/include/
-# )
 
 set(sources
 	src/rfmqtt.cpp
 )
 
-# add_subdirectory(src/vendor/paho.mqtt.c)
-# add_subdirectory(src/vendor/yaml-cpp)
+add_subdirectory(src/vendor/yaml-cpp EXCLUDE_FROM_ALL)
+add_subdirectory(src/vendor/docopt EXCLUDE_FROM_ALL)
+add_subdirectory(src/vendor/paho.mqtt.c EXCLUDE_FROM_ALL)
+
 
 set(CMAKE_CXX_STANDARD 11) # C++11...
 set(CMAKE_CXX_STANDARD_REQUIRED ON) #...is required...
@@ -27,8 +27,8 @@ if(CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_GNUCXX)
 endif()
 
 add_executable(rfmqtt ${sources})
-target_link_libraries(rfmqtt wiringPi)
-# target_include_directories(rfmqtt PRIVATE ${includes})
+target_link_libraries(rfmqtt wiringPi yaml-cpp docopt pthread paho-mqtt3c)
+target_include_directories(rfmqtt PRIVATE ${includes})
 
 # add_custom_command(TARGET rfmqtt POST_BUILD
 # 	COMMAND ${CMAKE_COMMAND} -E copy_if_different
