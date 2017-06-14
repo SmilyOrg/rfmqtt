@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.2)
 include(ExternalProject)
 
-project(rfmqtt CXX)
+project(rfmqtt C CXX)
 
 set(includes
 	src/vendor/
@@ -11,20 +11,18 @@ set(includes
 
 set(sources
 	src/rfmqtt.cpp
+	src/vendor/cbuffer/cbuffer.c
 )
 
 add_subdirectory(src/vendor/yaml-cpp EXCLUDE_FROM_ALL)
 add_subdirectory(src/vendor/docopt EXCLUDE_FROM_ALL)
 add_subdirectory(src/vendor/paho.mqtt.c EXCLUDE_FROM_ALL)
 
-
 set(CMAKE_CXX_STANDARD 11) # C++11...
 set(CMAKE_CXX_STANDARD_REQUIRED ON) #...is required...
 set(CMAKE_CXX_EXTENSIONS OFF) #...without compiler extensions like gnu++11
 
-if(CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_GNUCXX)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-long-long -pedantic")
-endif()
+set(CMAKE_CXX_FLAGS "-Wall -Wno-long-long -pedantic")
 
 add_executable(rfmqtt ${sources})
 target_link_libraries(rfmqtt wiringPi yaml-cpp docopt pthread paho-mqtt3c)

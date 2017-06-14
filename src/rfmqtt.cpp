@@ -11,92 +11,41 @@
 #include <bitset>
 #include <cstring>
 #include <sstream>
+#include <thread>
+#include <random>
+#include <condition_variable>
 
 #include <wiringPi.h>
 #include "yaml-cpp/yaml.h"
 #include "docopt/docopt.h"
-#include "readerwriterqueue/readerwriterqueue.h"
 #include "MQTTClient.h"
+extern "C" {
+    #include "cbuffer/cbuffer.h"
+}
 
 using namespace std::chrono;
-using namespace moodycamel;
+// using namespace moodycamel;
 
 std::string app_name = "rfmqtt";
 
-int pin = 17;
+int pin = -1;
 
 bool raw = false;
 bool scan = false;
 
-float dev_start_max = 0.1;
-float dev_trit_max = 0.1;
+float dev_start_max = 0.2;
+float dev_trit_max = 0.2;
 float dev_mean_target = 0.05;
-float quality_min = 0.7;
-int hold_ms = 250;
+float quality_min = 0.5;
+int hold_ms = 1000;
 
-BlockingReaderWriterQueue<std::pair<int, int>> queue(1000);
+// BlockingReaderWriterQueue<std::pair<int, int>> queue(1000);
+// BlockingReaderWriterQueue<int> queue(1000);
+cbuf_t *cbuffer = cbuf_new(14);
 
 high_resolution_clock::time_point last_time;
-// microseconds last_micro;
-// microseconds period_micro;
-// int last_state;
 
-/*
-int edge_num = 0;
-int edge_state;
-int period;
-unsigned int address;
 
-void readPeriodBit(int period, int state) {
-    std::cout << period << ": " << state << std::endl;
-}
-
-void interrupt() {
-    // Negate state as the timing applies to the previous state, before the edge
-    int state = 1 - digitalRead(pin);
-    high_resolution_clock::time_point read_time = high_resolution_clock::now();
-    auto micro = duration_cast<microseconds>(read_time - last_time);
-    
-    std::cout << micro.count() << " " << state << std::endl;
-
-    // auto lm = last_micro.count();
-    auto m = micro.count();
-    // std::cout << rm << std::endl;
-
-    if (edge_num < 2) {
-        // if (last_state == 1 && state == 0 && lm*8 < m && lm*12 > m) {
-        //     period_micro = last_micro;
-        //     auto rm = (double)m / lm;
-        //     std::cout << "Possible start pulse " << rm << " " << lm << "us " << m/10 << "us" << std::endl;
-        //     // edge_num = 2;
-        //     edge_state = state;
-
-        //     address = 0;
-        //     period = 0;
-        // }
-    }
-    if (edge_num >= 2) {
-        if (edge_state != state) {
-            std::cout << "Invalid edge transition, aborting" << std::endl;
-            edge_num = 0;
-        } else {
-            edge_num++;
-            int batch = round((float)m / period_micro.count());
-            std::cout << "batch " << batch << std::endl;
-            // while (batch > 0) {
-            //     readPeriodBit(period, state);
-            //     period++;
-            //     batch--;
-            // }
-        }
-    }
-    edge_state = !edge_state;
-
-    last_time = read_time;
-    last_micro = micro;
-    last_state = state;
-}
-*/
 
 #define MCHECK(call) { \
     int rc = call; \
@@ -121,12 +70,15 @@ public:
     std::string broker;
     std::string username;
     std::string password;
-    std::string prefix;
     int keep_alive_interval = -1;
     int qos = 0;
 
-    Mqtt() {
+    int backoff_min = 50;
+    int backoff_max = 2000;
+    int backoff_cur;
 
+    Mqtt() {
+        backoff_cur = backoff_min;
     }
 
     void connect() {
@@ -139,7 +91,21 @@ public:
 
         MCHECK(MQTTClient_create(&client, broker.c_str(), client_id.c_str(), MQTTCLIENT_PERSISTENCE_NONE, nullptr));
         MCHECK(MQTTClient_setCallbacks(client, this, mqtt_disconnected, mqtt_received, mqtt_delivered));
-        MCHECK(MQTTClient_connect(client, &opts));
+        int status = MQTTClient_connect(client, &opts);
+        if (status == MQTTCLIENT_SUCCESS) {
+            backoff_cur = backoff_min;
+            std::cout << "Connected" << std::endl;
+        } else {
+            reconnect();
+        }
+    }
+
+    void reconnect() {
+        std::cout << "Reconnecting in " << backoff_cur << " ms" << std::endl;
+        std::this_thread::sleep_for(milliseconds(backoff_cur));
+        backoff_cur += std::rand() % backoff_cur;
+        backoff_cur = std::min(backoff_cur, backoff_max);
+        connect();
     }
 
     void publish(std::string topic, std::string payload) {
@@ -183,7 +149,8 @@ public:
 
     void disconnected(char *cause)
     {
-        fprintf(stderr, "Connection lost: %s\n", cause);
+        fprintf(stderr, "Disconnected\n");
+        reconnect();
     }
 
 } mqtt;
@@ -203,7 +170,6 @@ void mqtt_disconnected(void *context, char *cause)
 {
     auto queue = static_cast<Mqtt*>(context);
     queue->disconnected(cause);
-    fprintf(stderr, "\nConnection lost: %s\n", cause);
 }
 
 
@@ -214,11 +180,6 @@ float getPatternDeviation(std::vector<int> pattern, std::vector<int> micros) {
 
     std::vector<float > diffsq(pattern.size());
     
-    // std::transform(pattern.begin(), pattern.end(), micros.begin(), std::back_inserter(diffsq), [pattern_sum, micros_sum](int p, int m) {
-        // return (p / pattern_sum) - (m / micros_sum);
-        // return 5;
-    // });
-
     std::transform(pattern.begin(), pattern.end(), micros.begin(), diffsq.begin(), [pattern_sum, micros_sum](int p, int m) {
         float diff = (p / pattern_sum) - (m / micros_sum);
         return diff * diff;
@@ -241,70 +202,114 @@ std::pair<int, float> getBestPattern(std::vector<std::vector<int>> patterns, std
     return { min_index, min_dev };
 }
 
-struct RfDevice {
-    uint32_t address;
-    std::bitset<31> address_bits;
-
-    std::vector<std::vector<std::string>> topics;
+struct Topic {
+    std::string name;
+    int group = -1;
+    int unit = -1;
 
     high_resolution_clock::time_point last_time;
+    int last_onoff = -1;
+};
+
+class RfDevice {
+    std::thread holder;
+
+public:
+    uint32_t address;
+    std::bitset<31> address_bits;
+    std::vector<Topic> topics;
+    bool running = true;
+    bool delaying = false;
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    high_resolution_clock::time_point last_update;
+    high_resolution_clock::time_point wake_point;
+
+
+    RfDevice() {}
+    RfDevice(const RfDevice& device) :
+        holder(),
+
+        address(device.address),
+        address_bits(device.address_bits),
+        topics(device.topics),
+        running(device.running) {}
+
+    ~RfDevice() {
+        running = false;
+        if (holder.joinable()) holder.join();
+    }
 
     void init() {
         address_bits = address;
+        // holder = std::thread(&RfDevice::hold_runner, this);
     }
 
-    void add_topic(int group, int unit, std::string topic) {
-        if ((unsigned int)group >= topics.size()) {
-            topics.resize(group + 1);
-        }
+    void hold_runner() {
+        while (running) {
+            
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [this] { return this->delaying; });
+                delaying = false;
 
-        auto &topics_unit = topics[group];
-        if ((unsigned int)unit >= topics_unit.size()) {
-            topics_unit.resize(unit + 1, "");
-        }
+                high_resolution_clock::time_point next_wake = wake_point;
+                lock.unlock();
 
-        topics_unit[unit] = topic;
+                std::this_thread::sleep_until(next_wake);
+                high_resolution_clock::time_point awoken;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    awoken = wake_point;
+                }
+                if (next_wake == awoken) {
+                    std::cout << "NOW" << std::endl;
+                }
+
+            }
+
+            // finished = true;
+            // std::this_thread::sleep_for(milliseconds(500)); 
+            // std::cout << "finished" << std::endl;
+
+
+        } 
     }
-
-    const std::string get_topic(int group, int unit) {
-        if ((unsigned int)group >= topics.size()) {
-            return "";
-        }
-        
-        auto &topics_unit = topics[group];
-        if ((unsigned int)unit >= topics_unit.size()) {
-            return "";
-        }
-
-        return topics[group][unit];
-    } 
 
     void update(int group, int unit, int onoff, int dim) {
         
-        // int prev_onoff = state_unit[unit];
-        // state_unit[unit] = onoff;
-    
+
         high_resolution_clock::time_point update_time = high_resolution_clock::now();
-        auto millis = duration_cast<milliseconds>(update_time - last_time);
 
-        if (millis.count() > hold_ms) {
-            // std::string prev_onoff_str = prev_onoff == -1 ? "NA" : prev_onoff ? "ON" : "OFF";
+        for (auto &topic : topics) {
+            if (topic.group != -1 && topic.group != group) continue;
+            if (topic.unit != -1 && topic.unit != unit) continue;
+            if (topic.last_onoff == onoff) {
+                auto millis = duration_cast<milliseconds>(update_time - topic.last_time);
+                if (millis.count() < hold_ms) {
+                    continue;
+                }
+            }
+
+            // {
+                // std::lock_guard<std::mutex> lock(mutex);
+            //     wake_point = update_time + milliseconds(500);
+            //     delaying = true;
+            // }
+            // cv.notify_all();
+
+            // printf("< %s %s\n", topic.name.c_str(), onoff_str.c_str());
             std::string onoff_str = onoff == -1 ? "NA" : onoff ? "ON" : "OFF";
+            mqtt.publish(topic.name, onoff_str);
+            printf("< %s %s\n", topic.name.c_str(), onoff_str.c_str());
 
-            std::ostringstream topic;
-            topic << "switch/";
-            topic << address;
-            topic << "/";
-            topic << group;
-            topic << "/";
-            topic << unit;
+            topic.last_onoff = onoff;
+            topic.last_time = update_time;
 
-            mqtt.publish(topic.str(), onoff_str);
-
-            printf("> %07x / %d / %d / %s\n", address, group, unit, onoff_str.c_str());
         }
 
-        last_time = update_time;
+        last_update = update_time;
 
     }
 
@@ -313,6 +318,21 @@ struct RfDevice {
 std::vector<RfDevice> devices;
 
 namespace YAML {
+
+    template<>
+    struct convert<Topic> {
+        static Node encode(const Topic& rhs) {
+            Node node;
+            return node;
+        }
+        static bool decode(const Node& node, Topic& topic) {
+            topic.name = node["name"].as<std::string>();
+            if (node["group"]) topic.group = node["group"].as<int>();
+            if (node["unit"]) topic.unit = node["unit"].as<int>();
+            return true;
+        }
+    };
+
     template<>
     struct convert<RfDevice> {
         static Node encode(const RfDevice& rhs) {
@@ -326,17 +346,11 @@ namespace YAML {
             device.address = node["address"].as<int>();
             
             auto topics = node["topics"];
-
-            std::cout << "topics " << topics.size() << std::endl;
-
-            for (auto topic = topics.begin(); topic != topics.end(); topic++) {
-                std::cout << topic->second << std::endl;
-                // std::cout << topic["name"] << std::endl;
-                // std::cout << topic["group"] << std::endl;
-                // std::cout << topic["unit"] << std::endl;
+            for (std::size_t i = 0; i < topics.size(); i++) {
+                Topic topic = topics[i].as<Topic>();
+                device.topics.push_back(topic);
             }
-            
-            // device.add_topic()
+
             return true;
         }
     };
@@ -402,10 +416,10 @@ struct RfDetector {
         
         if (!valid) return;
 
-        if (id >= 0) {
+        // if (id >= 0) {
             // printf("%4d %d %d trit %d, local edge %d, %4d us\n",
                 // id, state, edge_state, trit_num, local_edge, micro);
-        }
+        // }
         
         local_micros[local_edge] = micro;
         
@@ -457,13 +471,15 @@ struct RfDetector {
                     printf("%6d %3.f%% address %07x  group %d  onoff %d  unit %2d  dim %2d   all %0.3f  min %0.3f  max %0.3f\n",
                         id, quality*100, address, group, onoff, unit, dim, dev_mean, dev_min, dev_max
                     );
-                }
-                
-                for (auto &device : devices) {
-                    if (device.address == address) {
-                        device.update(group, unit, onoff, dim);
+                } else {
+                    // std::cout << end_pulse.first << " " << end_pulse.second << std::endl;
+                    for (auto &device : devices) {
+                        if (device.address == address) {
+                            device.update(group, unit, onoff, dim);
+                        }
                     }
                 }
+                
             }
 
             finished = true;
@@ -571,11 +587,17 @@ public:
 
 void interrupt() {
     // Negate state as the timing applies to the previous state, before the edge
+    int microstate[2];
     int state = 1 - digitalRead(pin);
     high_resolution_clock::time_point read_time = high_resolution_clock::now();
     auto micro = duration_cast<microseconds>(read_time - last_time);
     int m = micro.count();
-    queue.try_enqueue({ m, state });
+    microstate[0] = m;
+    microstate[1] = state;
+
+    cbuf_offer(cbuffer, (unsigned char*)&microstate[0], 8);
+    // queue.try_enqueue({ m, state });
+    // queue.try_enqueue(m);
     last_time = read_time;
 }
 
@@ -584,23 +606,22 @@ static const char USAGE[] =
 R"(rfmqtt
 
     Usage:
-      rfmqtt [--config=<file>] [--file=<file>]
-      rfmqtt raw [--config=<file>] [--file=<file>]
-      rfmqtt scan [--config=<file>] [--file=<file>]
-      rfmqtt file <raw.tsv>
-      rfmqtt (-h | --help)
-      rfmqtt --version
+        rfmqtt [--config=<file>] [--file=<file>]
+        rfmqtt raw [--config=<file>] [--file=<file>]
+        rfmqtt scan [--config=<file>] [--file=<file>]
+        rfmqtt file <raw.tsv>
+        rfmqtt (-h | --help)
+        rfmqtt --version
 
     Options:
-      -f --file=<file> Read raw values from a file.
-      -h --help     Show this screen.
-      --version     Show version.
+        -f --file=<file> Read raw values from a file.
+        -h --help     Show this screen.
+        --version     Show version.
 )";
 
 
 int main (int argc, const char** argv)
 {
-
     std::string config_file = "config.yaml";
 
     std::map<std::string, docopt::value> args
@@ -608,29 +629,23 @@ int main (int argc, const char** argv)
                          { argv + 1, argv + argc },
                          true,           // show help if requested
                          "rfmqtt 0.1");  // version string
-
+ 
     if (args["--config"]) config_file = args["--config"].asString();
     
     mqtt.client_id = app_name;
 
+
     try {
         YAML::Node config = YAML::LoadFile(config_file);
 
-        auto config_devices = config["devices"];
+        pin = config["pin"].as<int>();
 
-        for (unsigned int i = 0; i < config_devices.size(); i++) {
-            RfDevice device = config_devices[i].as<RfDevice>();
-            device.init();
-            // printf("%d %7x\n", i, device.address);
-            devices.push_back(device);
-        }
 
         auto broker = config["broker"];
         auto username = config["username"];
         auto password = config["password"];
         auto keepalive = config["keepalive"];
-        auto prefix = config["prefix"];
-
+        
         if (!broker) throw "'broker' not found";
         mqtt.broker = broker.as<std::string>();
         std::cout << "Broker: " << mqtt.broker << std::endl;
@@ -647,8 +662,43 @@ int main (int argc, const char** argv)
             mqtt.keep_alive_interval = keepalive.as<int>();
             std::cout << "Keep alive: " << mqtt.keep_alive_interval << std::endl;
         }
-        if (prefix) {
-            mqtt.prefix = prefix.as<std::string>();
+
+        auto config_devices = config["devices"];
+        std::cout << "Topics:" << std::endl;
+        for (unsigned int i = 0; i < config_devices.size(); i++) {
+            RfDevice device = config_devices[i].as<RfDevice>();
+            for (auto &topic : device.topics) {
+                printf("- %s ( %7x / %d / %d )\n",
+                    topic.name.c_str(), device.address, topic.group, topic.unit);
+            }
+            devices.push_back(device);
+            RfDevice &dev = devices.back();
+            dev.init();
+        }
+        
+        auto params = config["params"];
+        if (params) {
+            std::cout << "Params:" << std::endl;
+            if (params["start-max"]) {
+                dev_start_max = params["start-max"].as<float>();
+                std::cout << "  start-max: " << dev_start_max << std::endl;
+            }
+            if (params["trit-max"]) {
+                dev_trit_max = params["trit-max"].as<float>();
+                std::cout << "  trit-max: " << dev_trit_max << std::endl;
+            }
+            if (params["mean-target"]) {
+                dev_mean_target = params["mean-target"].as<float>();
+                std::cout << "  mean-target: " << dev_mean_target << std::endl;
+            }
+            if (params["quality-min"]) {
+                quality_min = params["quality-min"].as<float>();
+                std::cout << "  quality-min: " << quality_min << std::endl;
+            }
+            if (params["hold-ms"]) {
+                hold_ms = params["hold-ms"].as<int>();
+                std::cout << "  hold-ms: " << hold_ms << std::endl;
+            }
         }
 
         std::cout << std::endl;
@@ -663,6 +713,7 @@ int main (int argc, const char** argv)
         return 2;
     }
 
+    // Print arguments
     // for(auto const& arg : args) {
         // std::cout << arg.first <<  arg.second << std::endl;
     // }
@@ -673,7 +724,6 @@ int main (int argc, const char** argv)
     if (args["--file"]) {
         std::string file = args["--file"].asString();
         std::ifstream recording(file);
-        // std::cout << "Replaying from " << file << std::endl;
         int line = 0;
         int micro, state;
         while (recording >> micro >> state)
@@ -684,22 +734,45 @@ int main (int argc, const char** argv)
         }
     } else {
         wiringPiSetupGpio();
+
         wiringPiISR(pin, INT_EDGE_BOTH, interrupt);
+        
+        // pinMode(pin, INPUT);
+        // int last_state = -1;
+        // int count = 0;
+        // int poll_interval = 50;
         for (;;)
         {
-            // int v = digitalRead(pin);
-            // high_resolution_clock::time_point read_time = high_resolution_clock::now();
+            // std::this_thread::sleep_for(microseconds(poll_interval));
+            // int state = digitalRead(pin);
+            // count++;
+            // if (last_state != state) {
+            //     std::cout << poll_interval*count << "\t" << state << std::endl;
+            //     last_state = state;
+            //     count = 0;
+            // }
 
-            // duration<double> elapsed = duration_cast<duration<double>>(read_time - start);
-
-            // printf("%f %d\n", elapsed.count(), v);
+            std::this_thread::sleep_for(milliseconds(100));
+            int used = cbuf_usedspace(cbuffer);
             
-            std::pair<int, int> microstate;
-            queue.wait_dequeue(microstate);
+            // std::cout << used << std::endl;
 
-            stream.advance(microstate.first, microstate.second);
-            
-            // if (queue.size_approx() > 0) std::cout << queue.size_approx() << " " << microstate.first << " " << microstate.second << std::endl;
+            const int int_size = sizeof(int);
+            int ints = used / int_size;
+            int* p = (int*)cbuf_peek(cbuffer);
+            for (int i = 0; i < ints; i += 2) {
+                int micro = p[i];
+                int state = p[i + 1];
+                stream.advance(micro, state);
+            }
+            cbuf_poll(cbuffer, ints*int_size);
+
+
+            // std::pair<int, int> microstate;
+            // queue.wait_dequeue(microstate);
+            // stream.advance(microstate.first, microstate.second);
+            // int micro;
+            // queue.wait_dequeue(micro);
         }
     }
 

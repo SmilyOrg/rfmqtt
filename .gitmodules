@@ -4,9 +4,9 @@
 [submodule "src/vendor/docopt"]
 	path = src/vendor/docopt
 	url = https://github.com/docopt/docopt.cpp.git
-[submodule "src/vendor/readerwriterqueue"]
-	path = src/vendor/readerwriterqueue
-	url = https://github.com/cameron314/readerwriterqueue.git
 [submodule "src/vendor/paho.mqtt.c"]
 	path = src/vendor/paho.mqtt.c
 	url = https://github.com/eclipse/paho.mqtt.c.git
+[submodule "src/vendor/cbuffer"]
+	path = src/vendor/cbuffer
+	url = https://github.com/willemt/cbuffer.git

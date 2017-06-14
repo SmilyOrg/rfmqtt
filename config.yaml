@@ -1,0 +1,44 @@
+# The Raspberry Pi GPIO pin number to listen on
+pin: 17
+
+# Set the URI of your MQTT broker here
+broker: tcp://localhost:1883
+
+# MQTT username (optional)
+# username: "batman"
+
+# MQTT password (optional)
+# password: "ih8jokr"
+
+# MQTT keep alive time (in seconds)
+# keepalive: 60
+
+devices:
+  - address: 0xC0FFEE
+    topics:
+      - unit: 1 # Applies to all commands with unit == 3
+        name: switch/left # The MQTT topic to publish on
+      - unit: 2
+        group: 3 # Filters are optional, this filters the topic to group == 3
+        name: switch/right
+
+params: # Optional
+  # Maximum deviation from the perfect signal for the starting pulse
+  start-max: 0.1
+  
+  # Maximum deviation for content trits (3 state bit) pulses.
+  trit-max: 0.1
+  
+  # The total deviation target mean to base the quality off of.
+  mean-target: 0.05
+  
+  # The minimum quality to accept. If the deviation mean equals the mean target
+  # above, the quality comes out to 50% or 0.5 as written here. A smaller
+  # deviation means better quality.
+  quality-min: 0.75
+
+  # For how long to ignore repeated duplicate commands sent out by devices
+  # before publishing to MQTT again.
+  hold-ms: 1000
+
+
