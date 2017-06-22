@@ -21,6 +21,9 @@ devices:
       - unit: 2
         group: 3 # Filters are optional, this filters the topic to group == 3
         name: switch/right
+      - unit: 1
+        onoff: 1 # This makes it act like a momentary switch
+        name: switch/topLeft
 
 params: # Optional
   # Maximum deviation from the perfect signal for the starting pulse
@@ -40,5 +43,9 @@ params: # Optional
   # For how long to ignore repeated duplicate commands sent out by devices
   # before publishing to MQTT again.
   hold-ms: 1000
+
+  # For how long to wait for the pulses to stop before assuming the button
+  # was released. Only for momentary switch (see above).
+  press-ms: 800
 
 

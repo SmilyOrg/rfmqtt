@@ -27,6 +27,7 @@ using namespace std::chrono;
 // using namespace moodycamel;
 
 std::string app_name = "rfmqtt";
+std::string app_version = "0.1";
 
 int pin = -1;
 
@@ -38,6 +39,7 @@ float dev_trit_max = 0.2;
 float dev_mean_target = 0.05;
 float quality_min = 0.5;
 int hold_ms = 1000;
+int press_ms = 800;
 
 // BlockingReaderWriterQueue<std::pair<int, int>> queue(1000);
 // BlockingReaderWriterQueue<int> queue(1000);
@@ -109,6 +111,7 @@ public:
     }
 
     void publish(std::string topic, std::string payload) {
+        printf("< %s %s\n", topic.c_str(), payload.c_str());
         MCHECK(MQTTClient_publish(
             client,
             topic.c_str(),
@@ -206,9 +209,10 @@ struct Topic {
     std::string name;
     int group = -1;
     int unit = -1;
+    int onoff = -1;
 
     high_resolution_clock::time_point last_time;
-    int last_onoff = -1;
+    int prev_state = -1;
 };
 
 class RfDevice {
@@ -226,7 +230,6 @@ public:
     high_resolution_clock::time_point last_update;
     high_resolution_clock::time_point wake_point;
 
-
     RfDevice() {}
     RfDevice(const RfDevice& device) :
         holder(),
@@ -243,7 +246,7 @@ public:
 
     void init() {
         address_bits = address;
-        // holder = std::thread(&RfDevice::hold_runner, this);
+        holder = std::thread(&RfDevice::hold_runner, this);
     }
 
     void hold_runner() {
@@ -262,9 +265,15 @@ public:
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     awoken = wake_point;
-                }
-                if (next_wake == awoken) {
-                    std::cout << "NOW" << std::endl;
+                    if (next_wake == awoken) {
+                        for (auto &topic : topics) {
+                            if (topic.onoff == -1) continue;
+                            if (topic.prev_state == 1) {
+                                mqtt.publish(topic.name, "OFF");
+                                topic.prev_state = 0;
+                            }
+                        }
+                    }
                 }
 
             }
@@ -279,32 +288,37 @@ public:
 
     void update(int group, int unit, int onoff, int dim) {
         
-
         high_resolution_clock::time_point update_time = high_resolution_clock::now();
+        // printf("%7d %d %d %d %d\n", address, group, unit, onoff, dim);
 
         for (auto &topic : topics) {
             if (topic.group != -1 && topic.group != group) continue;
             if (topic.unit != -1 && topic.unit != unit) continue;
-            if (topic.last_onoff == onoff) {
-                auto millis = duration_cast<milliseconds>(update_time - topic.last_time);
-                if (millis.count() < hold_ms) {
-                    continue;
+            if (topic.onoff != -1) {
+                if (topic.onoff != onoff) continue;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    wake_point = update_time + milliseconds(press_ms);
+                    delaying = true;
                 }
+                cv.notify_all();
+                if (topic.prev_state != 1) {
+                    mqtt.publish(topic.name, "ON");
+                    topic.prev_state = 1;
+                }
+            } else {
+                if (topic.prev_state == onoff) {
+                    auto millis = duration_cast<milliseconds>(update_time - topic.last_time);
+                    if (millis.count() < hold_ms) {
+                        continue;
+                    }
+                }
+                std::string onoff_str = onoff == -1 ? "NA" : onoff ? "ON" : "OFF";
+                mqtt.publish(topic.name, onoff_str);
+                topic.prev_state = onoff;
+                // printf("< %s %s\n", topic.name.c_str(), onoff_str.c_str());
             }
 
-            // {
-                // std::lock_guard<std::mutex> lock(mutex);
-            //     wake_point = update_time + milliseconds(500);
-            //     delaying = true;
-            // }
-            // cv.notify_all();
-
-            // printf("< %s %s\n", topic.name.c_str(), onoff_str.c_str());
-            std::string onoff_str = onoff == -1 ? "NA" : onoff ? "ON" : "OFF";
-            mqtt.publish(topic.name, onoff_str);
-            printf("< %s %s\n", topic.name.c_str(), onoff_str.c_str());
-
-            topic.last_onoff = onoff;
             topic.last_time = update_time;
 
         }
@@ -329,6 +343,7 @@ namespace YAML {
             topic.name = node["name"].as<std::string>();
             if (node["group"]) topic.group = node["group"].as<int>();
             if (node["unit"]) topic.unit = node["unit"].as<int>();
+            if (node["onoff"]) topic.onoff = node["onoff"].as<int>();
             return true;
         }
     };
@@ -614,32 +629,70 @@ R"(rfmqtt
         rfmqtt --version
 
     Options:
+        --config=<file> Use a different configuration YAML file.
         -f --file=<file> Read raw values from a file.
         -h --help     Show this screen.
         --version     Show version.
 )";
 
+std::string getEnvVar(std::string const& key)
+{
+    char const* val = getenv(key.c_str()); 
+    return val == NULL ? std::string() : std::string(val);
+}
+
+std::string getEnvPath(std::string const& key, std::string const& path)
+{
+    std::string val = getEnvVar(key);
+    if (val.empty()) return val;
+    return val + path;
+}
 
 int main (int argc, const char** argv)
 {
-    std::string config_file = "config.yaml";
-
     std::map<std::string, docopt::value> args
         = docopt::docopt(USAGE,
                          { argv + 1, argv + argc },
                          true,           // show help if requested
-                         "rfmqtt 0.1");  // version string
+                         app_name + " " + app_version);  // version string
  
-    if (args["--config"]) config_file = args["--config"].asString();
+    std::string config_name = "config.yaml";
+    std::vector<std::string> config_paths = {
+        "./" + config_name,
+        getEnvPath("XDG_CONFIG_HOME", "/" + app_name + "/" + config_name),
+        getEnvPath("HOME", "/.config/" + app_name + "/" + config_name),
+        getEnvPath("XDG_CONFIG_DIRS", "/" + app_name + "/" + config_name),
+        "/etc/xdg/" + app_name + "/" + config_name,
+    };
+    
+    if (args["--config"]) {
+        config_paths.insert(config_paths.begin(), args["--config"].asString());
+    }
     
     mqtt.client_id = app_name;
 
-
     try {
-        YAML::Node config = YAML::LoadFile(config_file);
+        YAML::Node config;
+
+        bool config_loaded = false;
+        std::string config_paths_tried;
+        for (auto config_path : config_paths) {
+            if (config_path.empty()) continue;
+            try {
+                config = YAML::LoadFile(config_path);
+            } catch (YAML::BadFile badFile) {
+                config_paths_tried += "  " + config_path + " (" + badFile.msg + ")\n";
+                continue;
+            }
+            config_loaded = true;
+            std::cout << "Config: " << config_path << std::endl;
+            break;
+        }
+        if (!config_loaded) {
+            throw std::string("config file not found at any of the following paths:\n") + config_paths_tried;
+        }
 
         pin = config["pin"].as<int>();
-
 
         auto broker = config["broker"];
         auto username = config["username"];
@@ -699,18 +752,22 @@ int main (int argc, const char** argv)
                 hold_ms = params["hold-ms"].as<int>();
                 std::cout << "  hold-ms: " << hold_ms << std::endl;
             }
+            if (params["press-ms"]) {
+                hold_ms = params["press-ms"].as<int>();
+                std::cout << "  press-ms: " << hold_ms << std::endl;
+            }
         }
 
         std::cout << std::endl;
 
         mqtt.connect();
-
-    } catch (YAML::BadFile badFile) {
-        std::cerr << "Error: " << config_file << " not found (" << badFile.msg << ")" << std::endl;
+    
+    } catch (std::string msg) {
+        std::cerr << "Error: " << msg << std::endl;
         return 1;
     } catch (const char* msg) {
         std::cerr << "Error: " << msg << std::endl;
-        return 2;
+        return 1;
     }
 
     // Print arguments

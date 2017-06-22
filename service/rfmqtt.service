@@ -2,8 +2,7 @@
 Description=RF 433MHz to MQTT bridge
 
 [Service]
-ExecStart=/home/pi/rfmqtt/dist/rfmqtt
-WorkingDirectory=/home/pi/rfmqtt
+ExecStart=/usr/local/bin/rfmqtt
 Restart=on-failure
 
 [Install]
